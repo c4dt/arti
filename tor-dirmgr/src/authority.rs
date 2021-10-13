@@ -3,7 +3,11 @@
 //! From a client's point of view, an authority's role is to to sign the
 //! consensus directory.
 
+// Code mostly copied from Arti.
+
+use anyhow::{bail, Context, Error, Result};
 use serde::Deserialize;
+use std::str::FromStr;
 use tor_llcrypto::pk::rsa::RsaIdentity;
 use tor_netdoc::doc::authcert::{AuthCert, AuthCertKeyIds};
 
@@ -42,6 +46,36 @@ impl Authority {
     }
 }
 
+impl FromStr for Authority {
+    type Err = Error;
+
+    /// Parse Authority from a string.
+    fn from_str(authority_raw: &str) -> Result<Self, Self::Err> {
+        // name, v3ident_raw
+        let authority: Vec<&str> = authority_raw.split_whitespace().collect();
+
+        if authority.len() != 2 {
+            bail!(format!(
+                "Invalid format for authority, expected 2 elements, found {}.",
+                authority.len()
+            ));
+        }
+
+        let name = authority[0];
+        let v3ident_raw = authority[1];
+
+        let v3ident =
+            hex::decode(v3ident_raw).context("Built-in authority identity had bad hex!?")?;
+        let v3ident = RsaIdentity::from_bytes(&v3ident)
+            .context("Built-in authority identity had wrong length!?")?;
+
+        Ok(Authority {
+            name: name.to_string(),
+            v3ident,
+        })
+    }
+}
+
 /// Return a vector of the default directory authorities.
 pub(crate) fn default_authorities() -> Vec<Authority> {
     /// Build an authority; panic if input is bad.
@@ -53,16 +87,5 @@ pub(crate) fn default_authorities() -> Vec<Authority> {
         Authority { name, v3ident }
     }
 
-    // (List generated August 2020.)
-    vec![
-        auth("bastet", "27102BC123E7AF1D4741AE047E160C91ADC76B21"),
-        auth("dannenberg", "0232AF901C31A04EE9848595AF9BB7620D4C5B2E"),
-        auth("dizum", "E8A9C45EDE6D711294FADF8E7951F4DE6CA56B58"),
-        auth("Faravahar", "EFCBE720AB3A82B99F9E953CD5BF50F7EEFC7B97"),
-        auth("gabelmoo", "ED03BB616EB2F60BEC80151114BB25CEF515B226"),
-        auth("longclaw", "23D15D965BC35114467363C165C4F724B64B4F66"),
-        auth("maatuska", "49015F787433103580E3B66A1707A00E60F2D15B"),
-        auth("moria1", "D586D18309DED4CD6D57C18FDB97EFA96D330566"),
-        auth("tor26", "14C131DFC5C6F93646BE72FA1401C02A8DF2E8B4"),
-    ]
+    vec![auth("spring", "A1B62E1027298A07181BFEA6801360C21DDEDE51")]
 }

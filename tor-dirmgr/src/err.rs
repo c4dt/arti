@@ -1,5 +1,7 @@
 //! Declare an error type for the tor-dirmgr crate.
 
+// Code mostly copied from Arti.
+
 use thiserror::Error;
 
 /// An error originated by the directory manager code

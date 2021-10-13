@@ -6,6 +6,8 @@
 //! [decorrelated jitter]: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
 //! [`dir-spec.txt`]: https://spec.torproject.org/dir-spec
 
+// Code mostly copied from Arti.
+
 use rand::Rng;
 use std::convert::TryInto;
 use std::num::NonZeroU32;

@@ -10,25 +10,28 @@
 //! [`bootstrap`](crate::bootstrap) module for functions that actually
 //! load or download directory information.
 
+// Code mostly copied from Arti.
+
+use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::lock::Mutex;
-use log::{info, warn};
-use rand::Rng;
-use std::collections::{HashMap, HashSet};
+use log::{debug, info, warn};
+use rand::{seq::SliceRandom, Rng};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Weak;
 use std::time::{Duration, SystemTime};
+use std::{
+    fs,
+    io::{self, BufReader},
+};
+
 use tor_netdir::{MdReceiver, NetDir, PartialNetDir};
 use tor_netdoc::doc::netstatus::Lifetime;
 
 use crate::{
-    docmeta::{AuthCertMeta, ConsensusMeta},
-    retry::RetryConfig,
-    shared_ref::SharedMutArc,
-    storage::sqlite::SqliteStore,
-    CacheUsage, ClientRequest, DirState, DocId, DocumentText, Error, NetDirConfig, Readiness,
-    Result,
+    docmeta::ConsensusMeta, shared_ref::SharedMutArc, CacheUsage, DirState, DocId, Error,
+    NetDirConfig, Result,
 };
 use tor_checkable::{ExternallySigned, SelfSigned, Timebound};
 use tor_llcrypto::pk::rsa::RsaIdentity;
@@ -40,7 +43,7 @@ use tor_netdoc::{
     doc::{
         authcert::{AuthCert, AuthCertKeyIds},
         microdesc::MicrodescReader,
-        netstatus::{ConsensusFlavor, UnvalidatedMdConsensus},
+        netstatus::{ConsensusFlavor, RouterStatus, UnvalidatedMdConsensus},
     },
     AllowAnnotations,
 };
@@ -96,16 +99,14 @@ impl<DM: WriteNetDir> GetConsensusState<DM> {
     /// Create a new GetConsensusState from a weak reference to a
     /// directory manager and a `cache_usage` flag.
     pub(crate) fn new(writedir: Weak<DM>, cache_usage: CacheUsage) -> Result<Self> {
-        let authority_ids: Vec<_> = if let Some(writedir) = Weak::upgrade(&writedir) {
-            writedir
-                .config()
-                .authorities()
-                .iter()
-                .map(|auth| *auth.v3ident())
-                .collect()
-        } else {
-            return Err(Error::ManagerDropped.into());
-        };
+        let authority_ids: Vec<_> = Weak::upgrade(&writedir)
+            .context(Error::ManagerDropped)?
+            .config()
+            .authorities()
+            .iter()
+            .map(|auth| *auth.v3ident())
+            .collect();
+
         Ok(GetConsensusState {
             cache_usage,
             next: None,
@@ -139,50 +140,23 @@ impl<DM: WriteNetDir> DirState for GetConsensusState<DM> {
             cache_usage: self.cache_usage,
         }]
     }
-    fn is_ready(&self, _ready: Readiness) -> bool {
-        false
-    }
     fn can_advance(&self) -> bool {
         self.next.is_some()
     }
-    fn dl_config(&self) -> Result<(usize, RetryConfig)> {
-        if let Some(wd) = Weak::upgrade(&self.writedir) {
-            Ok((1, *wd.config().timing().retry_consensus()))
-        } else {
-            Err(Error::ManagerDropped.into())
-        }
-    }
-    fn add_from_cache(&mut self, docs: HashMap<DocId, DocumentText>) -> Result<bool> {
-        let text = match docs.into_iter().next() {
-            None => return Ok(false),
-            Some((
-                DocId::LatestConsensus {
-                    flavor: ConsensusFlavor::Microdesc,
-                    ..
-                },
-                text,
-            )) => text,
-            _ => return Err(Error::Unwanted("Not an md consensus").into()),
+    fn add_from_cache(&mut self, docdir: &str) -> Result<bool> {
+        // side-loaded data
+        let consensus_path = format!("{}/consensus.txt", docdir);
+        let consensus =
+            fs::read_to_string(consensus_path).context("Failed to read the consensus.")?;
+
+        let churn_path = format!("{}/churn.txt", docdir);
+        let churn = match fs::File::open(churn_path).map(BufReader::new) {
+            Ok(file) => parse_churn(file).context("Failed to parse churn info.")?,
+            Err(_) => Vec::new(),
         };
 
-        self.add_consensus_text(true, text.as_str()?)
+        self.add_consensus_text(true, consensus.as_str(), churn)
             .map(|meta| meta.is_some())
-    }
-    async fn add_from_download(
-        &mut self,
-        text: &str,
-        _request: &ClientRequest,
-        storage: Option<&Mutex<SqliteStore>>,
-    ) -> Result<bool> {
-        if let Some(meta) = self.add_consensus_text(false, text)? {
-            if let Some(store) = storage {
-                let mut w = store.lock().await;
-                w.store_consensus(meta, ConsensusFlavor::Microdesc, true, text)?;
-            }
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
     fn advance(self: Box<Self>) -> Result<Box<dyn DirState>> {
         Ok(match self.next {
@@ -198,6 +172,26 @@ impl<DM: WriteNetDir> DirState for GetConsensusState<DM> {
     }
 }
 
+/// Parse churned routers info.
+fn parse_churn(churn_reader: impl io::BufRead) -> Result<Vec<RsaIdentity>> {
+    let churn: Vec<RsaIdentity> = churn_reader
+        .lines()
+        .collect::<io::Result<Vec<_>>>()
+        .context("Read churn lines as string")?
+        .iter()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let bytes = hex::decode(line).context("Decode churned router id")?;
+            RsaIdentity::from_bytes(&bytes).ok_or(anyhow!("Invalid router id"))
+        })
+        .collect::<Result<_>>()?;
+    debug!(
+        "Remove {} router(s) from custom consensus as their info is no longer valid.",
+        churn.len()
+    );
+    Ok(churn)
+}
+
 impl<DM: WriteNetDir> GetConsensusState<DM> {
     /// Helper: try to set the current consensus text from an input
     /// string `text`.  Refuse it if the authorities could never be
@@ -206,17 +200,38 @@ impl<DM: WriteNetDir> GetConsensusState<DM> {
         &mut self,
         from_cache: bool,
         text: &str,
+        churn: Vec<RsaIdentity>,
     ) -> Result<Option<&ConsensusMeta>> {
         // Try to parse it and get its metadata.
-        let (consensus_meta, unvalidated) = {
-            let (signedval, remainder, parsed) = MdConsensus::parse(text)?;
+        let (consensus_meta, mut unvalidated) = {
+            let (signed_part, remainder, parsed) = MdConsensus::parse(text)?;
             if let Ok(timely) = parsed.check_valid_now() {
-                let meta = ConsensusMeta::from_unvalidated(signedval, remainder, &timely);
+                let meta = ConsensusMeta::from_unvalidated(signed_part, remainder, &timely);
                 (meta, timely)
             } else {
                 return Ok(None);
             }
         };
+
+        // If the churn is above a threshold, we only consider a random subset
+        // of the churned routers.
+        let churn_threshold = unvalidated.consensus.routers.len() / 6;
+        let churn_set: HashSet<&RsaIdentity> = if churn.len() > churn_threshold {
+            warn!("Churn larger than threshold limit!");
+            let number_to_remove = churn.len() - churn_threshold;
+
+            churn
+                .choose_multiple(&mut rand::thread_rng(), churn.len() - number_to_remove)
+                .collect()
+        } else {
+            churn.iter().collect()
+        };
+
+        // We remove the churned routers from the consensus.
+        unvalidated
+            .consensus
+            .routers
+            .retain(|r| !churn_set.contains(r.rsa_identity()));
 
         // Check out what authorities we believe in, and see if enough
         // of them are purported to have singed this consensus.
@@ -298,107 +313,31 @@ impl<DM: WriteNetDir> DirState for GetCertsState<DM> {
             .map(|id| DocId::AuthCert(*id))
             .collect()
     }
-    fn is_ready(&self, _ready: Readiness) -> bool {
-        false
-    }
     fn can_advance(&self) -> bool {
         self.unvalidated.key_is_correct(&self.certs[..]).is_ok()
     }
-    fn dl_config(&self) -> Result<(usize, RetryConfig)> {
-        if let Some(wd) = Weak::upgrade(&self.writedir) {
-            Ok((1, *wd.config().timing().retry_certs()))
-        } else {
-            Err(Error::ManagerDropped.into())
-        }
-    }
-    fn add_from_cache(&mut self, docs: HashMap<DocId, DocumentText>) -> Result<bool> {
+    fn add_from_cache(&mut self, docdir: &str) -> Result<bool> {
         let mut changed = false;
-        // Here we iterate over the documents we want, taking them from
-        // our input and remembering them.
-        for id in self.missing_docs().iter() {
-            if let Some(cert) = docs.get(id) {
-                let parsed = AuthCert::parse(cert.as_str()?)?.check_signature()?;
-                if let Ok(cert) = parsed.check_valid_now() {
-                    self.missing_certs.remove(cert.key_ids());
-                    self.certs.push(cert);
-                    changed = true;
-                } else {
-                    warn!("Got a cert from our cache that we couldn't parse");
-                }
-            }
-        }
-        Ok(changed)
-    }
-    async fn add_from_download(
-        &mut self,
-        text: &str,
-        request: &ClientRequest,
-        storage: Option<&Mutex<SqliteStore>>,
-    ) -> Result<bool> {
-        let asked_for: HashSet<_> = match request {
-            ClientRequest::AuthCert(a) => a.keys().collect(),
-            _ => return Err(Error::BadArgument("Mismatched request").into()),
-        };
+        // side-loaded data
+        let certificate_path = format!("{}/certificate.txt", docdir);
+        let certificate =
+            fs::read_to_string(certificate_path).context("Failed to read the certificate.")?;
 
-        let mut newcerts = Vec::new();
-        for cert in AuthCert::parse_multiple(&text) {
-            if let Ok(parsed) = cert {
-                let s = parsed
-                    .within(&text)
-                    .expect("Certificate was not in input as expected");
-                if let Ok(wellsigned) = parsed.check_signature() {
-                    if let Ok(timely) = wellsigned.check_valid_now() {
-                        newcerts.push((timely, s));
-                    }
-                } else {
-                    // TODO: note the source.
-                    warn!("Badly signed certificate received and discarded.");
-                }
-            } else {
-                // TODO: note the source.
-                warn!("Unparseable certificate received and discared.");
-            }
+        let parsed = AuthCert::parse(certificate.as_str())?.check_signature()?;
+        if let Ok(cert) = parsed.check_valid_now() {
+            self.missing_certs.remove(cert.key_ids());
+            self.certs.push(cert);
+            changed = true;
         }
-
-        // Now discard any certs we didn't ask for.
-        let len_orig = newcerts.len();
-        newcerts.retain(|(cert, _)| asked_for.contains(cert.key_ids()));
-        if newcerts.len() != len_orig {
-            warn!("Discarding certificates that we didn't ask for.");
-        }
-
-        // We want to exit early if we aren't saving any certificates.
-        if newcerts.is_empty() {
-            return Ok(false);
-        }
-
-        if let Some(store) = storage {
-            // Write the certificates to the store.
-            let v: Vec<_> = newcerts[..]
-                .iter()
-                .map(|(cert, s)| (AuthCertMeta::from_authcert(cert), *s))
-                .collect();
-            let mut w = store.lock().await;
-            w.store_authcerts(&v[..])?;
-        }
-
-        // Remember the certificates in this state, and remove them
-        // from our list of missing certs.
-        let mut changed = false;
-        for (cert, _) in newcerts {
-            let ids = cert.key_ids();
-            if self.missing_certs.contains(ids) {
-                self.missing_certs.remove(ids);
-                self.certs.push(cert);
-                changed = true;
-            }
-        }
-
         Ok(changed)
     }
     fn advance(self: Box<Self>) -> Result<Box<dyn DirState>> {
         if self.can_advance() {
-            let validated = self.unvalidated.check_signature(&self.certs[..])?;
+            let validated = self
+                .unvalidated
+                .check_signature(&self.certs[..])
+                .context("Consensus validation failed.")?;
+
             Ok(Box::new(GetMicrodescsState::new(
                 validated,
                 self.consensus_meta,
@@ -412,10 +351,10 @@ impl<DM: WriteNetDir> DirState for GetCertsState<DM> {
         Some(self.consensus_meta.lifetime().valid_until())
     }
     fn reset(self: Box<Self>) -> Result<Box<dyn DirState>> {
-        Ok(Box::new(GetConsensusState::new(
-            self.writedir,
-            self.cache_usage,
-        )?))
+        Ok(Box::new(
+            GetConsensusState::new(self.writedir, self.cache_usage)
+                .context("Failed to create new GetConsensusState when resetting GetCertsState")?,
+        ))
     }
 }
 
@@ -468,14 +407,14 @@ impl<DM: WriteNetDir> GetMicrodescsState<DM> {
             reset_time,
         };
 
-        result.consider_upgrade();
+        result.consider_upgrade().context("considering upgrade")?;
         Ok(result)
     }
 
     /// Add a bunch of microdescriptors to the in-progress netdir.
     ///
     /// Return true if the netdir has just become usable.
-    fn register_microdescs<I>(&mut self, mds: I) -> bool
+    fn register_microdescs<I>(&mut self, mds: I) -> Result<bool>
     where
         I: IntoIterator<Item = Microdesc>,
     {
@@ -493,26 +432,27 @@ impl<DM: WriteNetDir> GetMicrodescsState<DM> {
                 Ok(())
             });
         }
-        false
+        Ok(false)
     }
 
     /// Check whether this netdir we're building has _just_ become
     /// usable when it was not previously usable.  If so, tell the
     /// dirmgr about it and return true; otherwise return false.
-    fn consider_upgrade(&mut self) -> bool {
+    fn consider_upgrade(&mut self) -> Result<bool> {
         if let Some(p) = self.partial.take() {
             match p.unwrap_if_sufficient() {
                 Ok(netdir) => {
-                    self.reset_time = pick_download_time(netdir.lifetime());
+                    self.reset_time =
+                        pick_download_time(netdir.lifetime()).context("picking download time")?;
                     if let Some(wd) = Weak::upgrade(&self.writedir) {
                         wd.netdir().replace(netdir);
-                        return true;
+                        return Ok(true);
                     }
                 }
                 Err(partial) => self.partial = Some(partial),
             }
         }
-        false
+        Ok(false)
     }
 }
 
@@ -527,102 +467,31 @@ impl<DM: WriteNetDir> DirState for GetMicrodescsState<DM> {
     fn missing_docs(&self) -> Vec<DocId> {
         self.missing.iter().map(|d| DocId::Microdesc(*d)).collect()
     }
-    fn is_ready(&self, ready: Readiness) -> bool {
-        match ready {
-            Readiness::Complete => self.missing.is_empty(),
-            Readiness::Usable => self.partial.is_none(),
-        }
-    }
     fn can_advance(&self) -> bool {
         false
     }
-    fn dl_config(&self) -> Result<(usize, RetryConfig)> {
-        if let Some(wd) = Weak::upgrade(&self.writedir) {
-            Ok((
-                wd.config().timing().microdesc_parallelism(),
-                *wd.config().timing().retry_microdescs(),
-            ))
-        } else {
-            Err(Error::ManagerDropped.into())
-        }
-    }
-    fn add_from_cache(&mut self, docs: HashMap<DocId, DocumentText>) -> Result<bool> {
-        let mut microdescs = Vec::new();
-        for (id, text) in docs {
-            if let DocId::Microdesc(digest) = id {
-                if !self.missing.remove(&digest) {
-                    // we didn't want this.
-                    continue;
-                }
-                if let Ok(md) = Microdesc::parse(text.as_str()?) {
-                    if md.digest() == &digest {
-                        microdescs.push(md);
-                        continue;
-                    }
-                }
-                warn!("Found a mismatched microdescriptor in cache; ignoring");
-            }
-        }
+    fn add_from_cache(&mut self, docdir: &str) -> Result<bool> {
+        // side-loaded data
+        let microdescriptors_path = format!("{}/microdescriptors.txt", docdir);
+        let microdescriptors = fs::read_to_string(microdescriptors_path)
+            .context("Failed to read microdescriptors.")?;
 
-        let changed = !microdescs.is_empty();
-        self.register_microdescs(microdescs);
-
-        Ok(changed)
-    }
-    async fn add_from_download(
-        &mut self,
-        text: &str,
-        request: &ClientRequest,
-        storage: Option<&Mutex<SqliteStore>>,
-    ) -> Result<bool> {
-        let requested: HashSet<_> = if let ClientRequest::Microdescs(req) = request {
-            req.digests().collect()
-        } else {
-            return Err(Error::BadArgument("Mismatched request").into());
-        };
         let mut new_mds = Vec::new();
-        for annotated in MicrodescReader::new(text, AllowAnnotations::AnnotationsNotAllowed) {
-            if let Ok(anno) = annotated {
-                let txt = anno
-                    .within(&text)
-                    .expect("annotation not from within text as expected");
-                let md = anno.into_microdesc();
-                if !requested.contains(md.digest()) {
-                    warn!(
-                        "Received microdescriptor we did not ask for: {:?}",
-                        md.digest()
-                    );
-                    continue;
-                }
-                self.missing.remove(md.digest());
-                new_mds.push((txt, md));
-            }
+        for anno in MicrodescReader::new(
+            microdescriptors.as_str(),
+            AllowAnnotations::AnnotationsNotAllowed,
+        )
+        .flatten()
+        {
+            let md = anno.into_microdesc();
+            self.missing.remove(md.digest());
+            new_mds.push(md);
         }
 
-        let mark_listed = self.meta.lifetime().valid_after();
-        if let Some(store) = storage {
-            let mut s = store.lock().await;
-            if !self.newly_listed.is_empty() {
-                s.update_microdescs_listed(self.newly_listed.iter(), mark_listed)?;
-                self.newly_listed.clear();
-            }
-            if !new_mds.is_empty() {
-                s.store_microdescs(
-                    new_mds.iter().map(|(txt, md)| (&txt[..], md.digest())),
-                    mark_listed,
-                )?;
-            }
-        }
-        if self.register_microdescs(new_mds.into_iter().map(|(_, md)| md)) {
-            // oh hey, this is no longer pending.
-            if let Some(store) = storage {
-                let mut store = store.lock().await;
-                info!("marked consensus usable.");
-                store.mark_consensus_usable(&self.meta)?;
-                // DOCDOC: explain why we're doing this here.
-                store.expire_all()?;
-            }
-        }
+        self.newly_listed.clear();
+        self.register_microdescs(new_mds)
+            .context("registering microdescs")?;
+
         Ok(true)
     }
     fn advance(self: Box<Self>) -> Result<Box<dyn DirState>> {
@@ -632,38 +501,40 @@ impl<DM: WriteNetDir> DirState for GetMicrodescsState<DM> {
         Some(self.reset_time)
     }
     fn reset(self: Box<Self>) -> Result<Box<dyn DirState>> {
-        Ok(Box::new(GetConsensusState::new(
-            self.writedir,
-            CacheUsage::MustDownload,
-        )?))
+        Ok(Box::new(
+            GetConsensusState::new(self.writedir, CacheUsage::MustDownload).context(
+                "Failed to create new GetConsensusState when resetting GetMicrodescsState",
+            )?,
+        ))
     }
 }
 
 /// Choose a random download time to replace a consensus whose lifetime
 /// is `lifetime`.
-fn pick_download_time(lifetime: &Lifetime) -> SystemTime {
-    let (lowbound, uncertainty) = client_download_range(lifetime);
+fn pick_download_time(lifetime: &Lifetime) -> Result<SystemTime> {
+    let (lowbound, uncertainty) =
+        client_download_range(lifetime).context("getting download range")?;
     let zero = Duration::new(0, 0);
     let t = lowbound + rand::thread_rng().gen_range(zero..uncertainty);
     info!("The current consensus is fresh until {}, and valid until {}. I've picked {} as the earliest time to replace it.",
           DateTime::<Utc>::from(lifetime.fresh_until()),
           DateTime::<Utc>::from(lifetime.valid_until()),
           DateTime::<Utc>::from(t));
-    t
+    Ok(t)
 }
 
 /// Based on the lifetime for a consensus, return the time range during which
 /// clients should fetch the next one.
-fn client_download_range(lt: &Lifetime) -> (SystemTime, Duration) {
+fn client_download_range(lt: &Lifetime) -> Result<(SystemTime, Duration)> {
     let valid_after = lt.valid_after();
     let fresh_until = lt.fresh_until();
     let valid_until = lt.valid_until();
     let voting_interval = fresh_until
         .duration_since(valid_after)
-        .expect("valid-after must precede fresh-until");
+        .context("valid-after must precede fresh-until")?;
     let whole_lifetime = valid_until
         .duration_since(valid_after)
-        .expect("valid-after must precede valid-until");
+        .context("valid-after must precede valid-until")?;
 
     // From dir-spec:
     // "This time is chosen uniformly at random from the interval
@@ -674,5 +545,5 @@ fn client_download_range(lt: &Lifetime) -> (SystemTime, Duration) {
     let remainder = whole_lifetime - lowbound;
     let uncertainty = (remainder * 7) / 8;
 
-    (valid_after + lowbound, uncertainty)
+    Ok((valid_after + lowbound, uncertainty))
 }

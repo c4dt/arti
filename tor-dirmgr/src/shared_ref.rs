@@ -1,5 +1,7 @@
 //! Utility module to safely refer to a mutable Arc.
 
+// Code mostly copied from Arti.
+
 use std::sync::{Arc, RwLock};
 
 use crate::{Error, Result};

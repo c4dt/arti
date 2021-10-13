@@ -3,10 +3,9 @@
 //! Directory configuration tells us where to load and store directory
 //! information, where to fetch it from, and how to validate it.
 
+// Code mostly copied from Arti.
+
 use crate::retry::RetryConfig;
-#[cfg(feature = "legacy-storage")]
-use crate::storage::legacy::LegacyStore;
-use crate::storage::sqlite::SqliteStore;
 use crate::Authority;
 use crate::{Error, Result};
 use tor_netdir::fallback::FallbackDir;
@@ -149,7 +148,7 @@ pub struct NetDirConfig {
 
     /// Location to use for storing and reading current-format
     /// directory information.
-    cache_path: PathBuf,
+    pub cache_path: PathBuf,
 
     /// Configuration information about the network.
     network: NetworkConfig,
@@ -189,6 +188,11 @@ impl NetDirConfigBuilder {
     /// Use `path` as the directory to use for current directory files.
     pub fn set_cache_path(&mut self, path: &Path) {
         self.cache_path = Some(path.to_path_buf());
+    }
+
+    /// Set directory authorities.
+    pub fn set_authorities(&mut self, authorities: &[Authority]) {
+        self.network.authority = authorities.to_vec();
     }
 
     /// Try to use the default cache path.
@@ -245,16 +249,6 @@ impl NetDirConfig {
             .ok_or(Error::BadNetworkConfig("No legacy cache path available"))?;
         let store = LegacyStore::new(path.clone());
         store.load_legacy(&self.authorities[..])
-    }
-
-    /// Create a SqliteStore from this configuration.
-    ///
-    /// Note that each time this is called, a new store object will be
-    /// created: you probably only want to call this once.
-    ///
-    /// The `readonly` argument is as for [`SqliteStore::from_path`]
-    pub(crate) fn open_sqlite_store(&self, readonly: bool) -> Result<SqliteStore> {
-        SqliteStore::from_path(&self.cache_path, readonly)
     }
 
     /// Return a slice of the configured authorities
