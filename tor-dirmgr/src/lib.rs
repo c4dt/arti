@@ -77,22 +77,12 @@ pub struct DirMgr<R: Runtime> {
     /// Configuration information: where to find directories, how to
     /// validate them, and so on.
     config: NetDirConfig,
-    /// Handle to our sqlite cache.
-    // XXXX I'd like to use an rwlock, but that's not feasible, since
-    // rusqlite::Connection isn't Sync.
-    // TODO: Does this have to be a futures::Mutex?  I would rather have
-    // a rule that we never hold the guard for this mutex across an async
-    // suspend point.  But that will be hard to enforce until the
-    // `must_not_suspend` lint is in stable.
-    store: Mutex<SqliteStore>,
+
     /// Our latest sufficiently bootstrapped directory, if we have one.
     ///
     /// We use the RwLock so that we can give this out to a bunch of other
     /// users, and replace it once a new directory is bootstrapped.
     netdir: SharedMutArc<NetDir>,
-
-    /// A circuit manager, if this DirMgr supports downloading.
-    circmgr: Option<Arc<CircMgr<R>>>,
 
     /// Our asynchronous runtime.
     runtime: R,
@@ -108,11 +98,11 @@ impl<R: Runtime> DirMgr<R> {
     /// In general, you shouldn't use this function in a long-running
     /// program; it's only suitable for command-line or batch tools.
     // TODO: I wish this function didn't have to be async or take a runtime.
-    pub async fn load_once(runtime: R, config: NetDirConfig) -> Result<Arc<NetDir>> {
-        let dirmgr = Arc::new(Self::from_config(config, runtime, None)?);
+    pub async fn load_once(runtime: R, config: NetDirConfig, docdir: &str) -> Result<Arc<NetDir>> {
+        let dirmgr = Arc::new(Self::from_config(config, runtime));
 
         // TODO: add some way to return a directory that isn't up-to-date
-        let _success = dirmgr.load_directory().await?;
+        let _success = dirmgr.load_directory(&docdir).await?;
 
         dirmgr
             .opt_netdir()
@@ -131,9 +121,9 @@ impl<R: Runtime> DirMgr<R> {
     pub async fn load_or_bootstrap_once(
         config: NetDirConfig,
         runtime: R,
-        circmgr: Arc<CircMgr<R>>,
+        docdir: &str,
     ) -> Result<Arc<NetDir>> {
-        let dirmgr = DirMgr::bootstrap_from_config(config, runtime, circmgr).await?;
+        let dirmgr = DirMgr::bootstrap_from_config(config, runtime, &docdir).await?; //, runtime, circmgr).await?;
         Ok(dirmgr.netdir())
     }
 
@@ -147,214 +137,39 @@ impl<R: Runtime> DirMgr<R> {
     pub async fn bootstrap_from_config(
         config: NetDirConfig,
         runtime: R,
-        circmgr: Arc<CircMgr<R>>,
+        docdir: &str,
     ) -> Result<Arc<Self>> {
-        let dirmgr = Arc::new(DirMgr::from_config(config, runtime.clone(), Some(circmgr))?);
+        let dirmgr = Arc::new(DirMgr::from_config(config, runtime));
 
         // Try to load from the cache.
-        let have_directory = dirmgr
-            .load_directory()
+        dirmgr
+            .load_directory(&docdir)
             .await
             .context("Error loading cached directory")?;
-
-        let (mut sender, receiver) = if have_directory {
-            info!("Loaded a good directory from cache.");
-            (None, None)
-        } else {
-            info!("Didn't get usable directory from cache.");
-            let (sender, receiver) = oneshot::channel();
-            (Some(sender), Some(receiver))
-        };
-
-        // Whether we loaded or not, we now start downloading.
-        let dirmgr_weak = Arc::downgrade(&dirmgr);
-        runtime.spawn(async move {
-            // TODO: don't warn when these are Error::ManagerDropped.
-            if let Err(e) = Self::reload_until_owner(&dirmgr_weak, &mut sender).await {
-                warn!("Unrecoverd error while waiting for bootstrap: {}", e);
-            } else if let Err(e) = Self::download_forever(dirmgr_weak, sender).await {
-                warn!("Unrecovered error while downloading: {}", e);
-            }
-        })?;
-
-        if let Some(receiver) = receiver {
-            let _ = receiver.await;
-        }
 
         info!("We have enough information to build circuits.");
 
         Ok(dirmgr)
     }
 
-    /// Try forever to either lock the storage (and thereby become the
-    /// owner), or to reload the database.
-    ///
-    /// If we have begin to have a bootstrapped directory, send a
-    /// message using `on_complete`.
-    ///
-    /// If we eventually become the owner, return Ok().
-    async fn reload_until_owner(
-        weak: &Weak<Self>,
-        on_complete: &mut Option<oneshot::Sender<()>>,
-    ) -> Result<()> {
-        let mut logged = false;
-        let mut bootstrapped = false;
-        let runtime = upgrade_weak_ref(weak)?.runtime.clone();
-
-        loop {
-            {
-                let dirmgr = upgrade_weak_ref(weak)?;
-                if dirmgr.try_upgrade_to_readwrite().await? {
-                    // We now own the lock!  (Maybe we owned it before; the
-                    // upgrade_to_readwrite() function is idempotent.)  We can
-                    // do our own bootstrapping.
-                    return Ok(());
-                }
-            }
-
-            if !logged {
-                logged = true;
-                info!("Another process is bootstrapping. Waiting till it finishes or exits.");
-            }
-
-            // We don't own the lock.  Somebody else owns the cache.  They
-            // should be updating it.  Wait a bit, then try again.
-            let pause = if bootstrapped {
-                std::time::Duration::new(120, 0)
-            } else {
-                std::time::Duration::new(5, 0)
-            };
-            runtime.sleep(pause).await;
-            // TODO: instead of loading the whole thing we should have a
-            // database entry that says when the last update was, or use
-            // our state functions.
-            {
-                let dirmgr = upgrade_weak_ref(weak)?;
-                if dirmgr.load_directory().await? {
-                    // Successfully loaded a bootstrapped directory.
-                    if let Some(send_done) = on_complete.take() {
-                        let _ = send_done.send(());
-                    }
-                    bootstrapped = true;
-                }
-            }
-        }
-    }
-
-    /// Try to fetch our directory info and keep it updated, indefinitely.
-    ///
-    /// If we have begin to have a bootstrapped directory, send a
-    /// message using `on_complete`.
-    async fn download_forever(
-        weak: Weak<Self>,
-        mut on_complete: Option<oneshot::Sender<()>>,
-    ) -> Result<()> {
-        let mut state: Box<dyn DirState> = Box::new(state::GetConsensusState::new(
-            Weak::clone(&weak),
-            CacheUsage::CacheOkay,
-        )?);
-
-        let (retry_config, runtime) = {
-            let dirmgr = upgrade_weak_ref(&weak)?;
-            (
-                *dirmgr.config.timing().retry_bootstrap(),
-                dirmgr.runtime.clone(),
-            )
-        };
-
-        loop {
-            let mut usable = false;
-            let mut retry_delay = retry_config.schedule();
-
-            'retry_attempt: for _ in retry_config.attempts() {
-                let (newstate, recoverable_err) =
-                    bootstrap::download(Weak::clone(&weak), state, on_complete.take()).await?;
-                state = newstate;
-
-                if let Some(err) = recoverable_err {
-                    if state.is_ready(Readiness::Usable) {
-                        usable = true;
-                        info!("Unable to completely download a directory: {}.  Nevertheless, the directory is usable, so we'll pause for now.", err);
-                        break 'retry_attempt;
-                    }
-
-                    let delay = retry_delay.next_delay(&mut rand::thread_rng());
-                    warn!(
-                        "Unable to download a usable directory: {}.  We will restart in {:?}.",
-                        err, delay
-                    );
-                    runtime.sleep(delay).await;
-                    state = state.reset()?;
-                } else {
-                    info!("Directory is complete.");
-                    usable = true;
-                    break 'retry_attempt;
-                }
-            }
-
-            if !usable {
-                // we ran out of attempts.
-                warn!(
-                    "We failed {} times to bootstrap a directory. We're going to give up.",
-                    retry_config.n_attempts()
-                );
-                return Err(Error::CantAdvanceState.into());
-            }
-
-            let reset_at = state.reset_time();
-            match reset_at {
-                Some(t) => runtime.sleep_until_wallclock(t).await,
-                None => return Ok(()),
-            }
-            state = state.reset()?;
-        }
-    }
-
-    /// Get a reference to the circuit manager, if we have one.
-    fn circmgr(&self) -> Result<Arc<CircMgr<R>>> {
-        self.circmgr
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| Error::NoDownloadSupport.into())
-    }
-
-    /// Try to make this a directory manager with read-write access to its
-    /// storage.
-    ///
-    /// Return true if we got the lock, or if we already had it.
-    ///
-    /// Return false if another process has the lock
-    async fn try_upgrade_to_readwrite(&self) -> Result<bool> {
-        self.store.lock().await.upgrade_to_readwrite()
-    }
-
     /// Construct a DirMgr from a NetDirConfig.
-    fn from_config(
-        config: NetDirConfig,
-        runtime: R,
-        circmgr: Option<Arc<CircMgr<R>>>,
-    ) -> Result<Self> {
-        let readonly = circmgr.is_none();
-        let store = Mutex::new(config.open_sqlite_store(readonly)?);
+    fn from_config(config: NetDirConfig, runtime: R) -> Self {
         let netdir = SharedMutArc::new();
-        Ok(DirMgr {
+        DirMgr {
             config,
-            store,
             netdir,
-            circmgr,
             runtime,
-        })
+        }
     }
 
     /// Load the latest non-pending non-expired directory from the
     /// cache, if it is newer than the one we have.
     ///
     /// Return false if there is no such consensus.
-    async fn load_directory(self: &Arc<Self>) -> Result<bool> {
-        //let store = &self.store;
-
-        let state = state::GetConsensusState::new(Arc::downgrade(self), CacheUsage::CacheOnly)?;
-        let _ = bootstrap::load(Arc::clone(self), Box::new(state)).await?;
+    async fn load_directory(self: &Arc<Self>, docdir: &str) -> Result<bool> {
+        let state = state::GetConsensusState::new(Arc::downgrade(self), CacheUsage::CacheOnly)
+            .context("Failed to create new GetConsensusState")?;
+        let _ = bootstrap::load(Box::new(state), &docdir).await?;
 
         Ok(self.netdir.get().is_some())
     }
@@ -372,161 +187,6 @@ impl<R: Runtime> DirMgr<R> {
     // TODO: Add variants of this that make sure that it's up-to-date?
     pub fn netdir(&self) -> Arc<NetDir> {
         self.opt_netdir().expect("DirMgr was not bootstrapped!")
-    }
-
-    /// Try to load the text of a signle document described by `doc` from
-    /// storage.
-    pub async fn text(&self, doc: &DocId) -> Result<Option<DocumentText>> {
-        let mut result = HashMap::new();
-        let query = doc.clone().into();
-        self.load_documents_into(&query, &mut result).await?;
-        if let Some((docid, doctext)) = result.into_iter().next() {
-            assert_eq!(&docid, doc);
-            Ok(Some(doctext))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Load the text for a collection of documents.
-    ///
-    /// If many of the documents have the same type, this can be more
-    /// efficient than calling [`text`](Self::text).
-    pub async fn texts<T>(&self, docs: T) -> Result<HashMap<DocId, DocumentText>>
-    where
-        T: IntoIterator<Item = DocId>,
-    {
-        let partitioned = docid::partition_by_type(docs);
-        let mut result = HashMap::new();
-        for (_, query) in partitioned.into_iter() {
-            self.load_documents_into(&query, &mut result).await?
-        }
-        Ok(result)
-    }
-
-    /// Load all the documents for a single DocumentQuery from the store.
-    async fn load_documents_into(
-        &self,
-        query: &DocQuery,
-        result: &mut HashMap<DocId, DocumentText>,
-    ) -> Result<()> {
-        use DocQuery::*;
-        let store = self.store.lock().await;
-        match query {
-            LatestConsensus {
-                flavor,
-                cache_usage,
-            } => {
-                if *cache_usage == CacheUsage::MustDownload {
-                    // Do nothing: we don't want a cached consensus.
-                } else if let Some(c) = store.latest_consensus(*flavor, cache_usage.pending_ok())? {
-                    let id = DocId::LatestConsensus {
-                        flavor: *flavor,
-                        cache_usage: *cache_usage,
-                    };
-                    result.insert(id, c.into());
-                }
-            }
-            AuthCert(ids) => result.extend(
-                store
-                    .authcerts(&ids)?
-                    .into_iter()
-                    .map(|(id, c)| (DocId::AuthCert(id), DocumentText::from_string(c))),
-            ),
-            Microdesc(digests) => {
-                result.extend(
-                    store
-                        .microdescs(digests)?
-                        .into_iter()
-                        .map(|(id, md)| (DocId::Microdesc(id), DocumentText::from_string(md))),
-                );
-            }
-            Routerdesc(digests) => result.extend(
-                store
-                    .routerdescs(digests)?
-                    .into_iter()
-                    .map(|(id, rd)| (DocId::Routerdesc(id), DocumentText::from_string(rd))),
-            ),
-        }
-        Ok(())
-    }
-
-    /// Convert a DocQuery into a set of ClientRequests, suitable for sending
-    /// to a directory cache.
-    ///
-    /// This conversion has to be a function of the dirmgr, since it may
-    /// require knowledge about our current state.
-    async fn query_into_requests(&self, q: DocQuery) -> Result<Vec<ClientRequest>> {
-        let mut res = Vec::new();
-        for q in q.split_for_download() {
-            match q {
-                DocQuery::LatestConsensus { flavor, .. } => {
-                    res.push(self.make_consensus_request(flavor).await?);
-                }
-                DocQuery::AuthCert(ids) => {
-                    res.push(ClientRequest::AuthCert(ids.into_iter().collect()));
-                }
-                DocQuery::Microdesc(ids) => {
-                    res.push(ClientRequest::Microdescs(ids.into_iter().collect()));
-                }
-                DocQuery::Routerdesc(ids) => {
-                    res.push(ClientRequest::Routerdescs(ids.into_iter().collect()));
-                }
-            }
-        }
-        Ok(res)
-    }
-
-    /// Construct an appropriate ClientRequest to download a consensus
-    /// of the given flavor.
-    async fn make_consensus_request(&self, flavor: ConsensusFlavor) -> Result<ClientRequest> {
-        let mut request = tor_dirclient::request::ConsensusRequest::new(flavor);
-
-        let r = self.store.lock().await;
-        match r.latest_consensus_meta(flavor) {
-            Ok(Some(meta)) => {
-                request.set_last_consensus_date(meta.lifetime().valid_after());
-                request.push_old_consensus_digest(*meta.sha3_256_of_signed());
-            }
-            Ok(None) => {}
-            Err(e) => {
-                warn!("Error loading directory metadata: {}", e);
-            }
-        }
-
-        Ok(ClientRequest::Consensus(request))
-    }
-
-    /// Given a request we sent and the response we got from a
-    /// directory server, see whether we should expand that response
-    /// into "something larger".
-    ///
-    /// Currently, this handles expanding consensus diffs, and nothing
-    /// else.  We do it at this stage of our downloading operation
-    /// because it requires access to the store.
-    async fn expand_response_text(&self, req: &ClientRequest, text: String) -> Result<String> {
-        if let ClientRequest::Consensus(req) = req {
-            if tor_consdiff::looks_like_diff(&text) {
-                if let Some(old_d) = req.old_consensus_digests().next() {
-                    let db_val = {
-                        let s = self.store.lock().await;
-                        s.consensus_by_sha3_digest_of_signed_part(old_d)?
-                    };
-                    if let Some((old_consensus, meta)) = db_val {
-                        info!("Applying a consensus diff");
-                        let new_consensus = tor_consdiff::apply_diff(
-                            old_consensus.as_str()?,
-                            &text,
-                            Some(*meta.sha3_256_of_signed()),
-                        )?;
-                        new_consensus.check_digest()?;
-                        return Ok(new_consensus.to_string());
-                    }
-                }
-                return Err(Error::Unwanted("Received a consensus diff we did not ask for").into());
-            }
-        }
-        return Ok(text);
     }
 }
 
@@ -573,7 +233,7 @@ trait DirState: Send {
     fn can_advance(&self) -> bool;
     /// Add one or more documents from our cache; returns 'true' if there
     /// was any change in this state.
-    fn add_from_cache(&mut self, docs: HashMap<DocId, DocumentText>) -> Result<bool>;
+    fn add_from_cache(&mut self, docdir: &str) -> Result<bool>;
 
     /// Add information that we have just downloaded to this state; returns
     /// 'true' if there as any change in this state.

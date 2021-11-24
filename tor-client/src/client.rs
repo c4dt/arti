@@ -82,12 +82,10 @@ impl<R: Runtime> TorClient<R> {
             runtime.clone(),
             Arc::clone(&chanmgr),
         ));
-        let dirmgr = tor_dirmgr::DirMgr::bootstrap_from_config(
-            dircfg,
-            runtime.clone(),
-            Arc::clone(&circmgr),
-        )
-        .await?;
+        let dircfg_2 = dircfg.clone();
+        let cache_path = dircfg_2.cache_path.to_str().unwrap();
+        let dirmgr =
+            tor_dirmgr::DirMgr::bootstrap_from_config(dircfg, runtime.clone(), cache_path).await?;
 
         Ok(TorClient {
             runtime,

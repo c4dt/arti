@@ -149,7 +149,7 @@ pub struct NetDirConfig {
 
     /// Location to use for storing and reading current-format
     /// directory information.
-    cache_path: PathBuf,
+    pub cache_path: PathBuf,
 
     /// Configuration information about the network.
     network: NetworkConfig,
@@ -189,6 +189,11 @@ impl NetDirConfigBuilder {
     /// Use `path` as the directory to use for current directory files.
     pub fn set_cache_path(&mut self, path: &Path) {
         self.cache_path = Some(path.to_path_buf());
+    }
+
+    /// Set directory authorities.
+    pub fn set_authorities(&mut self, authorities: &[Authority]) {
+        self.network.authority = authorities.to_vec();
     }
 
     /// Try to use the default cache path.
