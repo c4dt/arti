@@ -10,7 +10,7 @@
 //! [`bootstrap`](crate::bootstrap) module for functions that actually
 //! load or download directory information.
 
-use rand::Rng;
+use rand::{seq::SliceRandom, Rng};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex, Weak};
@@ -270,55 +270,104 @@ impl<DM: WriteNetDir> GetConsensusState<DM> {
         from_cache: bool,
         text: &str,
     ) -> Result<Option<&ConsensusMeta>> {
-        // Try to parse it and get its metadata.
-        let (consensus_meta, unvalidated) = {
-            let (signedval, remainder, parsed) = MdConsensus::parse(text)?;
-            let now = current_time(&self.writedir)?;
-            if let Ok(timely) = parsed.check_valid_at(&now) {
-                let meta = ConsensusMeta::from_unvalidated(signedval, remainder, &timely);
-                (meta, timely)
+        if let [consensus_text, churn_text] = text.split("###").collect::<Vec<&str>>()[..] {
+            // Try to parse it and get its metadata.
+            let (consensus_meta, mut unvalidated) = {
+                let (signedval, remainder, parsed) = MdConsensus::parse(consensus_text)?;
+                let now = current_time(&self.writedir)?;
+                if let Ok(timely) = parsed.check_valid_at(&now) {
+                    let meta = ConsensusMeta::from_unvalidated(signedval, remainder, &timely);
+                    (meta, timely)
+                } else {
+                    return Ok(None);
+                }
+            };
+
+            let churn = parse_churn(churn_text)?;
+
+            // If the churn is above a threshold, we only consider a random subset
+            // of the churned routers.
+            let churn_threshold = unvalidated.nb_relays() / 6;
+            let churn_set: HashSet<&RsaIdentity> = if churn.len() > churn_threshold {
+                warn!("Churn larger than threshold limit!");
+                let number_to_remove = churn.len() - churn_threshold;
+
+                churn
+                    .choose_multiple(&mut rand::thread_rng(), churn.len() - number_to_remove)
+                    .collect()
             } else {
-                return Ok(None);
+                churn.iter().collect()
+            };
+
+            // We remove the churned routers from the consensus.
+            if churn_set.is_empty() {
+                info!("All router(s) in custom consensus are still valid.");
+            } else {
+                info!(
+                    "Removing {} router(s) from custom consensus as their info is no longer valid.",
+                    churn_set.len()
+                );
+                unvalidated.remove_relays(&churn_set);
             }
-        };
 
-        // Check out what authorities we believe in, and see if enough
-        // of them are purported to have signed this consensus.
-        let n_authorities = self.authority_ids.len() as u16;
-        let unvalidated = unvalidated.set_n_authorities(n_authorities);
+            // Check out what authorities we believe in, and see if enough
+            // of them are purported to have signed this consensus.
+            let n_authorities = self.authority_ids.len() as u16;
+            let unvalidated = unvalidated.set_n_authorities(n_authorities);
 
-        let id_refs: Vec<_> = self.authority_ids.iter().collect();
-        if !unvalidated.authorities_are_correct(&id_refs[..]) {
-            return Err(Error::UnrecognizedAuthorities);
+            let id_refs: Vec<_> = self.authority_ids.iter().collect();
+            if !unvalidated.authorities_are_correct(&id_refs[..]) {
+                return Err(Error::UnrecognizedAuthorities);
+            }
+
+            // Make a set of all the certificates we want -- the subset of
+            // those listed on the consensus that we would indeed accept as
+            // authoritative.
+            let desired_certs = unvalidated
+                .signing_cert_ids()
+                .filter(|m| self.recognizes_authority(&m.id_fingerprint))
+                .collect();
+
+            self.next = Some(GetCertsState {
+                cache_usage: self.cache_usage,
+                from_cache,
+                unvalidated,
+                consensus_meta,
+                missing_certs: desired_certs,
+                certs: Vec::new(),
+                writedir: Weak::clone(&self.writedir),
+            });
+
+            // Unwrap should be safe because `next` was just assigned
+            #[allow(clippy::unwrap_used)]
+            Ok(Some(&self.next.as_ref().unwrap().consensus_meta))
+        } else {
+            Err(Error::StringParsingError(
+                "invalid consensus/churn data".to_string(),
+            ))
         }
-
-        // Make a set of all the certificates we want -- the subset of
-        // those listed on the consensus that we would indeed accept as
-        // authoritative.
-        let desired_certs = unvalidated
-            .signing_cert_ids()
-            .filter(|m| self.recognizes_authority(&m.id_fingerprint))
-            .collect();
-
-        self.next = Some(GetCertsState {
-            cache_usage: self.cache_usage,
-            from_cache,
-            unvalidated,
-            consensus_meta,
-            missing_certs: desired_certs,
-            certs: Vec::new(),
-            writedir: Weak::clone(&self.writedir),
-        });
-
-        // Unwrap should be safe because `next` was just assigned
-        #[allow(clippy::unwrap_used)]
-        Ok(Some(&self.next.as_ref().unwrap().consensus_meta))
     }
 
     /// Return true if `id` is an authority identity we recognize
     fn recognizes_authority(&self, id: &RsaIdentity) -> bool {
         self.authority_ids.iter().any(|auth| auth == id)
     }
+}
+
+/// Parse churned routers info.
+fn parse_churn(text: &str) -> Result<Vec<RsaIdentity>> {
+    let churn: Vec<RsaIdentity> = text
+        .lines()
+        .collect::<Vec<&str>>()
+        .iter()
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let bytes = hex::decode(line)?;
+            RsaIdentity::from_bytes(&bytes)
+                .ok_or_else(|| Error::StringParsingError("invalid identity".to_string()))
+        })
+        .collect::<Result<_>>()?;
+    Ok(churn)
 }
 
 /// Second state: fetching or loading authority certificates.
@@ -730,7 +779,7 @@ impl<DM: WriteNetDir> DirState for GetMicrodescsState<DM> {
     fn add_from_cache(
         &mut self,
         docs: HashMap<DocId, DocumentText>,
-        storage: Option<&Mutex<SqliteStore>>,
+        _storage: Option<&Mutex<SqliteStore>>,
     ) -> Result<bool> {
         let mut microdescs = Vec::new();
         for (id, text) in docs {
@@ -750,10 +799,7 @@ impl<DM: WriteNetDir> DirState for GetMicrodescsState<DM> {
         }
 
         let changed = !microdescs.is_empty();
-        if self.register_microdescs(microdescs) {
-            // Just stopped being pending.
-            self.mark_consensus_usable(storage)?;
-        }
+        self.register_microdescs(microdescs);
 
         Ok(changed)
     }

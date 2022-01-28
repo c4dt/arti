@@ -495,6 +495,15 @@ pub type MdConsensus = Consensus<MdConsensusRouterStatus>;
 /// but not for signatures.
 pub type UnvalidatedMdConsensus = UnvalidatedConsensus<MdConsensusRouterStatus>;
 
+impl UnvalidatedMdConsensus {
+    /// Remove provided relays from this unvalidated consensus
+    pub fn remove_relays(&mut self, set: &HashSet<&RsaIdentity>) {
+        self.consensus
+            .relays
+            .retain(|r| !set.contains(r.rsa_identity()));
+    }
+}
+
 /// An MdConsensus that has been parsed but not checked for signatures
 /// and timeliness.
 pub type UncheckedMdConsensus = UncheckedConsensus<MdConsensusRouterStatus>;
@@ -1417,6 +1426,11 @@ impl<RS> UnvalidatedConsensus<RS> {
     /// half of the authorities in the list.)
     pub fn authorities_are_correct(&self, authorities: &[&RsaIdentity]) -> bool {
         self.siggroup.could_validate(authorities)
+    }
+
+    /// Return the number of relays in this unvalidated consensus
+    pub fn nb_relays(&self) -> usize {
+        self.consensus.relays.len()
     }
 }
 

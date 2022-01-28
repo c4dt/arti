@@ -74,12 +74,15 @@ use postage::watch;
 pub use retry::DownloadSchedule;
 use tor_circmgr::CircMgr;
 use tor_netdir::NetDir;
+use tor_netdoc::doc::microdesc::MicrodescReader;
 use tor_netdoc::doc::netstatus::ConsensusFlavor;
+use tor_netdoc::AllowAnnotations;
 
 use futures::{channel::oneshot, task::SpawnExt};
 use tor_rtcompat::{Runtime, SleepProviderExt};
 use tracing::{info, trace, warn};
 
+use std::fs;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, sync::Weak};
 use std::{fmt::Debug, time::SystemTime};
@@ -600,6 +603,82 @@ impl<R: Runtime> DirMgr<R> {
         Ok(result)
     }
 
+    /// Load all the documents for a single DocumentQuery from the cache.
+    fn load_documents_into(
+        &self,
+        query: &DocQuery,
+        result: &mut HashMap<DocId, DocumentText>,
+    ) -> Result<()> {
+        use DocQuery::*;
+
+        let cfg = self.config.get();
+        let cache_path = cfg.cache_path().to_string_lossy();
+
+        match query {
+            LatestConsensus {
+                flavor,
+                cache_usage,
+            } => {
+                let path = format!("{}/consensus.txt", cache_path);
+                let consensus = fs::read_to_string(path)?;
+
+                let path = format!("{}/churn.txt", cache_path);
+                let churn = fs::read_to_string(path)?;
+
+                let id = DocId::LatestConsensus {
+                    flavor: *flavor,
+                    cache_usage: *cache_usage,
+                };
+                // Hack: in order to minimize changes, we pass the consensus and the churn in a
+                // single string
+                result.insert(
+                    id,
+                    DocumentText::from_string(vec![consensus, churn].join("###")),
+                );
+            }
+
+            AuthCert(ids) => {
+                let path = format!("{}/certificate.txt", cache_path);
+                let certificate = fs::read_to_string(path)?;
+
+                // Ignore the IDs and return the same certificate for each ID.
+                // FIXME: Add validation
+                result.extend(ids.iter().map(|id| {
+                    (
+                        DocId::AuthCert(*id),
+                        DocumentText::from_string(certificate.clone()),
+                    )
+                }));
+            }
+
+            Microdesc(_digests) => {
+                let path = format!("{}/microdescriptors.txt", cache_path);
+                let microdesc = fs::read_to_string(path)?;
+
+                // Ignore the given digsets and return all the microdescriptors from the file.
+                result.extend(
+                    MicrodescReader::new(
+                        microdesc.as_str(),
+                        &AllowAnnotations::AnnotationsNotAllowed,
+                    )
+                    .flatten()
+                    .map(|anno| {
+                        (
+                            DocId::Microdesc(*anno.md().digest()),
+                            DocumentText::from_string(
+                                anno.within(&microdesc).unwrap_or_default().to_string(),
+                            ),
+                        )
+                    }),
+                );
+            }
+            #[cfg(feature = "routerdesc")]
+            RouterDesc(_) => (),
+        }
+        Ok(())
+    }
+
+    /*** Replaced
     /// Load all the documents for a single DocumentQuery from the store.
     fn load_documents_into(
         &self,
@@ -651,6 +730,7 @@ impl<R: Runtime> DirMgr<R> {
         }
         Ok(())
     }
+    ***/
 
     /// Convert a DocQuery into a set of ClientRequests, suitable for sending
     /// to a directory cache.
