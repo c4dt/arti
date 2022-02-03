@@ -18,6 +18,8 @@ native-tls = [ "tor-rtcompat/native-tls" ]
 rustls = [ "tor-rtcompat/rustls" ]
 static = [ "tor-rtcompat/static", "tor-dirmgr/static" ]
 
+memorystore = []
+
 # Enable experimental APIs that are not yet officially supported.
 #
 # These APIs are not covered by semantic versioning.  Using this
