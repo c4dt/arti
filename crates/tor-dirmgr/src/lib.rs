@@ -678,7 +678,7 @@ impl<R: Runtime> DirMgr<R> {
                 let consensus = fs::read_to_string(path)?;
 
                 let path = format!("{}/churn.txt", cache_path);
-                let churn = fs::read_to_string(path)?;
+                let churn = fs::read_to_string(path).unwrap_or("".to_string());
 
                 let id = DocId::LatestConsensus {
                     flavor: *flavor,
