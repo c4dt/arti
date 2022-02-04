@@ -10,7 +10,9 @@
 //! [`bootstrap`](crate::bootstrap) module for functions that actually
 //! load or download directory information.
 
-use rand::{seq::SliceRandom, Rng};
+#[cfg(feature = "lightarti")]
+use rand::seq::SliceRandom;
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex, Weak};
@@ -265,6 +267,57 @@ impl<DM: WriteNetDir> GetConsensusState<DM> {
     /// Helper: try to set the current consensus text from an input
     /// string `text`.  Refuse it if the authorities could never be
     /// correct, or if it is ill-formed.
+    #[cfg(not(feature = "lightarti"))]
+    fn add_consensus_text(
+        &mut self,
+        from_cache: bool,
+        text: &str,
+    ) -> Result<Option<&ConsensusMeta>> {
+        // Try to parse it and get its metadata.
+        let (consensus_meta, unvalidated) = {
+            let (signedval, remainder, parsed) = MdConsensus::parse(text)?;
+            let now = current_time(&self.writedir)?;
+            if let Ok(timely) = parsed.check_valid_at(&now) {
+                let meta = ConsensusMeta::from_unvalidated(signedval, remainder, &timely);
+                (meta, timely)
+            } else {
+                return Ok(None);
+            }
+        };
+
+        // Check out what authorities we believe in, and see if enough
+        // of them are purported to have signed this consensus.
+        let n_authorities = self.authority_ids.len() as u16;
+        let unvalidated = unvalidated.set_n_authorities(n_authorities);
+
+        let id_refs: Vec<_> = self.authority_ids.iter().collect();
+        if !unvalidated.authorities_are_correct(&id_refs[..]) {
+            return Err(Error::UnrecognizedAuthorities);
+        }
+
+        // Make a set of all the certificates we want -- the subset of
+        // those listed on the consensus that we would indeed accept as
+        // authoritative.
+        let desired_certs = unvalidated
+            .signing_cert_ids()
+            .filter(|m| self.recognizes_authority(&m.id_fingerprint))
+            .collect();
+
+        self.next = Some(GetCertsState {
+            cache_usage: self.cache_usage,
+            from_cache,
+            unvalidated,
+            consensus_meta,
+            missing_certs: desired_certs,
+            certs: Vec::new(),
+            writedir: Weak::clone(&self.writedir),
+        });
+
+        // Unwrap should be safe because `next` was just assigned
+        #[allow(clippy::unwrap_used)]
+        Ok(Some(&self.next.as_ref().unwrap().consensus_meta))
+    }
+    #[cfg(feature = "lightarti")]
     fn add_consensus_text(
         &mut self,
         from_cache: bool,
@@ -355,6 +408,7 @@ impl<DM: WriteNetDir> GetConsensusState<DM> {
 }
 
 /// Parse churned routers info.
+#[cfg(feature = "lightarti")]
 fn parse_churn(text: &str) -> Result<Vec<RsaIdentity>> {
     let churn: Vec<RsaIdentity> = text
         .lines()
@@ -779,7 +833,8 @@ impl<DM: WriteNetDir> DirState for GetMicrodescsState<DM> {
     fn add_from_cache(
         &mut self,
         docs: HashMap<DocId, DocumentText>,
-        _storage: Option<&Mutex<SqliteStore>>,
+        #[cfg(feature = "lightarti")] _: Option<&Mutex<SqliteStore>>,
+        #[cfg(not(feature = "lightarti"))] storage: Option<&Mutex<SqliteStore>>,
     ) -> Result<bool> {
         let mut microdescs = Vec::new();
         for (id, text) in docs {
@@ -799,7 +854,11 @@ impl<DM: WriteNetDir> DirState for GetMicrodescsState<DM> {
         }
 
         let changed = !microdescs.is_empty();
-        self.register_microdescs(microdescs);
+        if self.register_microdescs(microdescs) {
+            // Just stopped being pending.
+            #[cfg(not(feature = "lightarti"))]
+            self.mark_consensus_usable(storage)?;
+        }
 
         Ok(changed)
     }

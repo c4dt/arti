@@ -74,14 +74,17 @@ use postage::watch;
 pub use retry::DownloadSchedule;
 use tor_circmgr::CircMgr;
 use tor_netdir::NetDir;
+#[cfg(feature = "lightarti")]
 use tor_netdoc::doc::microdesc::MicrodescReader;
 use tor_netdoc::doc::netstatus::ConsensusFlavor;
+#[cfg(feature = "lightarti")]
 use tor_netdoc::AllowAnnotations;
 
 use futures::{channel::oneshot, task::SpawnExt};
 use tor_rtcompat::{Runtime, SleepProviderExt};
 use tracing::{info, trace, warn};
 
+#[cfg(feature = "lightarti")]
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, sync::Weak};
@@ -603,7 +606,59 @@ impl<R: Runtime> DirMgr<R> {
         Ok(result)
     }
 
-    /// Load all the documents for a single DocumentQuery from the cache.
+    /// Load all the documents for a single DocumentQuery from the store.
+    #[cfg(not(feature = "lightarti"))]
+    fn load_documents_into(
+        &self,
+        query: &DocQuery,
+        result: &mut HashMap<DocId, DocumentText>,
+    ) -> Result<()> {
+        use DocQuery::*;
+        let store = self.store.lock().expect("Directory storage lock poisoned");
+        match query {
+            LatestConsensus {
+                flavor,
+                cache_usage,
+            } => {
+                if *cache_usage == CacheUsage::MustDownload {
+                    // Do nothing: we don't want a cached consensus.
+                    trace!("MustDownload is set; not checking for cached consensus.");
+                } else if let Some(c) =
+                    store.latest_consensus(*flavor, cache_usage.pending_requirement())?
+                {
+                    trace!("Found a reasonable consensus in the cache");
+                    let id = DocId::LatestConsensus {
+                        flavor: *flavor,
+                        cache_usage: *cache_usage,
+                    };
+                    result.insert(id, c.into());
+                }
+            }
+            AuthCert(ids) => result.extend(
+                store
+                    .authcerts(ids)?
+                    .into_iter()
+                    .map(|(id, c)| (DocId::AuthCert(id), DocumentText::from_string(c))),
+            ),
+            Microdesc(digests) => {
+                result.extend(
+                    store
+                        .microdescs(digests)?
+                        .into_iter()
+                        .map(|(id, md)| (DocId::Microdesc(id), DocumentText::from_string(md))),
+                );
+            }
+            #[cfg(feature = "routerdesc")]
+            RouterDesc(digests) => result.extend(
+                store
+                    .routerdescs(digests)?
+                    .into_iter()
+                    .map(|(id, rd)| (DocId::RouterDesc(id), DocumentText::from_string(rd))),
+            ),
+        }
+        Ok(())
+    }
+    #[cfg(feature = "lightarti")]
     fn load_documents_into(
         &self,
         query: &DocQuery,
@@ -655,7 +710,7 @@ impl<R: Runtime> DirMgr<R> {
                 let path = format!("{}/microdescriptors.txt", cache_path);
                 let microdesc = fs::read_to_string(path)?;
 
-                // Ignore the given digsets and return all the microdescriptors from the file.
+                // Ignore the given digests and return all the microdescriptors from the file.
                 result.extend(
                     MicrodescReader::new(
                         microdesc.as_str(),
@@ -677,60 +732,6 @@ impl<R: Runtime> DirMgr<R> {
         }
         Ok(())
     }
-
-    /*** Replaced
-    /// Load all the documents for a single DocumentQuery from the store.
-    fn load_documents_into(
-        &self,
-        query: &DocQuery,
-        result: &mut HashMap<DocId, DocumentText>,
-    ) -> Result<()> {
-        use DocQuery::*;
-        let store = self.store.lock().expect("Directory storage lock poisoned");
-        match query {
-            LatestConsensus {
-                flavor,
-                cache_usage,
-            } => {
-                if *cache_usage == CacheUsage::MustDownload {
-                    // Do nothing: we don't want a cached consensus.
-                    trace!("MustDownload is set; not checking for cached consensus.");
-                } else if let Some(c) =
-                    store.latest_consensus(*flavor, cache_usage.pending_requirement())?
-                {
-                    trace!("Found a reasonable consensus in the cache");
-                    let id = DocId::LatestConsensus {
-                        flavor: *flavor,
-                        cache_usage: *cache_usage,
-                    };
-                    result.insert(id, c.into());
-                }
-            }
-            AuthCert(ids) => result.extend(
-                store
-                    .authcerts(ids)?
-                    .into_iter()
-                    .map(|(id, c)| (DocId::AuthCert(id), DocumentText::from_string(c))),
-            ),
-            Microdesc(digests) => {
-                result.extend(
-                    store
-                        .microdescs(digests)?
-                        .into_iter()
-                        .map(|(id, md)| (DocId::Microdesc(id), DocumentText::from_string(md))),
-                );
-            }
-            #[cfg(feature = "routerdesc")]
-            RouterDesc(digests) => result.extend(
-                store
-                    .routerdescs(digests)?
-                    .into_iter()
-                    .map(|(id, rd)| (DocId::RouterDesc(id), DocumentText::from_string(rd))),
-            ),
-        }
-        Ok(())
-    }
-    ***/
 
     /// Convert a DocQuery into a set of ClientRequests, suitable for sending
     /// to a directory cache.
