@@ -2807,6 +2807,7 @@ dependencies = [
 name = "tor-dirmgr"
 version = "0.0.4"
 dependencies = [
+ "anyhow",
  "async-trait",
  "base64",
  "derive_builder",

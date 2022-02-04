@@ -3,6 +3,9 @@
 //! From a client's point of view, an authority's role is to to sign the
 //! consensus directory.
 
+use anyhow::{bail, Context, Error, Result};
+use std::str::FromStr;
+
 use derive_builder::Builder;
 use serde::Deserialize;
 use tor_llcrypto::pk::rsa::RsaIdentity;
@@ -52,6 +55,36 @@ impl Authority {
     /// Return true if this authority matches a given key ID.
     pub fn matches_keyid(&self, id: &AuthCertKeyIds) -> bool {
         self.v3ident == id.id_fingerprint
+    }
+}
+
+impl FromStr for Authority {
+    type Err = Error;
+
+    /// Parse Authority from a string.
+    fn from_str(authority_raw: &str) -> Result<Self, Self::Err> {
+        // name, v3ident_raw
+        let authority: Vec<&str> = authority_raw.split_whitespace().collect();
+
+        if authority.len() != 2 {
+            bail!(format!(
+                "Invalid format for authority, expected 2 elements, found {}.",
+                authority.len()
+            ));
+        }
+
+        let name = authority[0];
+        let v3ident_raw = authority[1];
+
+        let v3ident =
+            hex::decode(v3ident_raw).context("Built-in authority identity had bad hex!?")?;
+        let v3ident = RsaIdentity::from_bytes(&v3ident)
+            .context("Built-in authority identity had wrong length!?")?;
+
+        Ok(Authority {
+            name: name.to_string(),
+            v3ident,
+        })
     }
 }
 
