@@ -20,6 +20,7 @@ memorystore = []
 
 [dependencies]
 anyhow = "1"
+lazy_static = "1"
 
 retry-error = { path = "../retry-error", version = "0.0.3"}
 tor-checkable = { path = "../tor-checkable", version = "0.0.3"}

@@ -17,7 +17,7 @@ use crate::docmeta::{AuthCertMeta, ConsensusMeta};
 use crate::{Error, Result};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{path::Path, str::Utf8Error};
 
 #[cfg(feature = "memorystore")]
@@ -182,6 +182,35 @@ impl From<Vec<u8>> for InputString {
         }
     }
 }
+
+/// Configuration of expiration of each element of a [`Store`].
+pub(super) struct ExpirationConfig {
+    /// How long to keep expired router descriptors.
+    pub(super) router_descs: Duration,
+    /// How long to keep expired microdescriptors descriptors.
+    pub(super) microdescs: Duration,
+    /// How long to keep expired authority certificate.
+    pub(super) authcerts: Duration,
+    /// How long to keep expired consensus.
+    pub(super) consensuses: Duration,
+}
+
+/// Configuration of expiration shared between [`Store`] implementations.
+pub(super) const CONFIG: ExpirationConfig = {
+    /// Number of seconds to make a day.
+    const DAY: u64 = 60 * 60 * 24;
+    /// Number of seconds to make a month.
+    const MONTH: u64 = 30 * DAY;
+
+    ExpirationConfig {
+        // TODO: Choose a more realistic time.
+        router_descs: Duration::from_secs(3 * MONTH),
+        // TODO: Choose a more realistic time.
+        microdescs: Duration::from_secs(3 * MONTH),
+        authcerts: Duration::ZERO,
+        consensuses: Duration::from_secs(2 * DAY),
+    }
+};
 
 /// Representation of a storage.
 ///

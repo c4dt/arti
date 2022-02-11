@@ -3,10 +3,12 @@
 //! We store most objects in sqlite tables, except for very large ones,
 //! which we store as "blob" files in a separate directory.
 
+use super::CONFIG;
 use crate::docmeta::{AuthCertMeta, ConsensusMeta};
 use crate::storage::{InputString, Store};
 use crate::{Error, Result};
 
+use lazy_static::lazy_static;
 use tor_netdoc::doc::authcert::AuthCertKeyIds;
 use tor_netdoc::doc::microdesc::MdDigest;
 use tor_netdoc::doc::netstatus::{ConsensusFlavor, Lifetime};
@@ -294,10 +296,10 @@ impl Store for SqliteStore {
         };
 
         tx.execute(DROP_OLD_EXTDOCS, [])?;
-        tx.execute(DROP_OLD_MICRODESCS, [])?;
-        tx.execute(DROP_OLD_AUTHCERTS, [])?;
-        tx.execute(DROP_OLD_CONSENSUSES, [])?;
-        tx.execute(DROP_OLD_ROUTERDESCS, [])?;
+        tx.execute(&DROP_OLD_MICRODESCS, [])?;
+        tx.execute(&DROP_OLD_AUTHCERTS, [])?;
+        tx.execute(&DROP_OLD_CONSENSUSES, [])?;
+        tx.execute(&DROP_OLD_ROUTERDESCS, [])?;
         tx.commit()?;
         for name in expired_blobs {
             let fname = self.blob_fname(name);
@@ -834,29 +836,36 @@ const UPDATE_MD_LISTED: &str = "
 ";
 
 /// Query: Discard every expired extdoc.
-const DROP_OLD_EXTDOCS: &str = "
-  DELETE FROM ExtDocs WHERE expires < datetime('now');
-";
-/// Query: Discard every router descriptor that hasn't been listed for 3
-/// months.
-// TODO: Choose a more realistic time.
-const DROP_OLD_ROUTERDESCS: &str = "
-  DELETE FROM RouterDescs WHERE published < datetime('now','-3 months');
-  ";
-/// Query: Discard every microdescriptor that hasn't been listed for 3 months.
-// TODO: Choose a more realistic time.
-const DROP_OLD_MICRODESCS: &str = "
-  DELETE FROM Microdescs WHERE last_listed < datetime('now','-3 months');
-";
-/// Query: Discard every expired authority certificate.
-const DROP_OLD_AUTHCERTS: &str = "
-  DELETE FROM Authcerts WHERE expires < datetime('now');
-";
-/// Query: Discard every consensus that's been expired for at least
-/// two days.
-const DROP_OLD_CONSENSUSES: &str = "
-  DELETE FROM Consensuses WHERE valid_until < datetime('now','-2 days');
-";
+///
+/// External documents aren't exposed through [`Store`].
+const DROP_OLD_EXTDOCS: &str = "DELETE FROM ExtDocs WHERE expires < datetime('now');";
+
+lazy_static! {
+    /// Query: Discard every router descriptor that hasn't been listed for 3
+    /// months.
+    // TODO: Choose a more realistic time.
+    static ref DROP_OLD_ROUTERDESCS: String = format!(
+        "DELETE FROM RouterDescs WHERE published < datetime('now', '-{} seconds');",
+        CONFIG.router_descs.as_secs(),
+    );
+    /// Query: Discard every microdescriptor that hasn't been listed for 3 months.
+    // TODO: Choose a more realistic time.
+    static ref DROP_OLD_MICRODESCS: String = format!(
+        "DELETE FROM Microdescs WHERE last_listed < datetime('now', '-{} seconds');",
+        CONFIG.microdescs.as_secs(),
+    );
+    /// Query: Discard every expired authority certificate.
+    static ref DROP_OLD_AUTHCERTS: String = format!(
+        "DELETE FROM Authcerts WHERE expires < datetime('now', '-{} seconds');",
+        CONFIG.authcerts.as_secs(),
+    );
+    /// Query: Discard every consensus that's been expired for at least
+    /// two days.
+    static ref DROP_OLD_CONSENSUSES: String = format!(
+        "DELETE FROM Consensuses WHERE valid_until < datetime('now','-{} seconds');",
+        CONFIG.consensuses.as_secs(),
+    );
+}
 
 #[cfg(test)]
 mod test {

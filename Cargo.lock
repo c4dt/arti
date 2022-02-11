@@ -2821,6 +2821,7 @@ dependencies = [
  "hex-literal",
  "humantime-serde",
  "itertools",
+ "lazy_static",
  "memmap2",
  "once_cell",
  "postage",
